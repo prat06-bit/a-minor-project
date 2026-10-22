@@ -1,0 +1,7 @@
+# Optional: primary CP-SAT allocation backend, with SciPy MILP fallback.
+ortools>=9.10
+# Optional extension for embedding-based semantic skill similarity.
+sentence-transformers>=3.0
+# Optional API wrapper for future service integration.
+fastapi>=0.115
+uvicorn>=0.30

@@ -1,0 +1,7 @@
+{
+  "status": "not_evaluated",
+  "reason": "No legitimate candidate demographic/policy data or authoritative affirmative-action rules were supplied.",
+  "sensitive_attributes_used_as_merit_features": false,
+  "allocation_capacity_violations": 0,
+  "note": "Capacity compliance is validated separately. Do not infer fairness from synthetic proxy-label metrics."
+}

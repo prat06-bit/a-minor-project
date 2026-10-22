@@ -1,0 +1,26 @@
+{
+  "synthetic_only": true,
+  "metrics_csv": "C:\\Users\\LENOVO\\OneDrive\\Documents\\ChatGPT\\dataneededforpmis\\data\\outputs\\experiments\\model_metrics.csv",
+  "allocation": {
+    "solver": "scipy.optimize.milp",
+    "solver_status": "Optimization terminated successfully. (HiGHS Status 7: Optimal)",
+    "eligible_pairs": 4800,
+    "allocations": 1109,
+    "unique_candidates_allocated": 1109,
+    "capacity_violations": 0,
+    "total_match_score": 696.591662,
+    "output": "C:\\Users\\LENOVO\\OneDrive\\Documents\\ChatGPT\\dataneededforpmis\\data\\outputs\\experiments\\capacity_aware_allocations.csv"
+  },
+  "data_quality": {
+    "clean_pair_rows": 12000,
+    "clean_pair_duplicate_ids": 0,
+    "corruption_levels": [
+      0.0,
+      0.05,
+      0.1,
+      0.2
+    ],
+    "corrupted_and_cleaned_files": true
+  },
+  "caveat": "All model targets are synthetic heuristic labels. No actual PMIS selection outcome was available."
+}

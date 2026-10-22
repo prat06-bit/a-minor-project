@@ -1,0 +1,15 @@
+{
+  "split": "unseen_source_internship_ids_and_unseen_candidates",
+  "model": "logistic_regression",
+  "train_rows": 1394,
+  "test_rows": 2335,
+  "train_candidates": 172,
+  "test_candidates": 1028,
+  "heldout_source_internships": 70,
+  "precision": 0.7221374045801526,
+  "recall": 0.879182156133829,
+  "f1": 0.7929589270746018,
+  "roc_auc": 0.9702772899069702,
+  "pr_auc": 0.9154752362420983,
+  "label_note": "synthetic proxy-label agreement only"
+}

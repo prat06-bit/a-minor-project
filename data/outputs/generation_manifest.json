@@ -1,0 +1,39 @@
+{
+  "seed": 20261020,
+  "config": {
+    "seed": 20261020,
+    "n_candidates": 1200,
+    "n_internships": 350,
+    "n_pairs": 12000,
+    "corruption_levels": [
+      0.0,
+      0.05,
+      0.1,
+      0.2
+    ],
+    "default_corruption_rate": 0.1,
+    "label_threshold": 0.56,
+    "skill_similarity_backend": "token_overlap",
+    "sentence_transformer_model": "sentence-transformers/all-MiniLM-L6-v2",
+    "output_dir": "data/outputs"
+  },
+  "source_workbook": "C:\\Users\\LENOVO\\OneDrive\\Documents\\ChatGPT\\dataneededforpmis\\data\\source\\PMIS_MyBharat_Qualification_District_Mapping.xlsx",
+  "source_sha256": "f06244b41d8afa919dc717a4d666636ba4aa545ab676857b86c7db985e2e3a13",
+  "source_sheets": [
+    "Main",
+    "States",
+    "Districts"
+  ],
+  "source_main_rows": 1062,
+  "candidate_rows": 1200,
+  "internship_rows": 350,
+  "pair_rows": 12000,
+  "positive_proxy_labels": 2642,
+  "negative_proxy_labels": 9358,
+  "target_definition": "synthetic heuristic; not observed PMIS selections",
+  "files": {
+    "candidates": "data\\outputs\\clean\\synthetic_candidates.csv",
+    "internships": "data\\outputs\\clean\\synthetic_internships.csv",
+    "pairs": "data\\outputs\\clean\\synthetic_clean_pairs.csv"
+  }
+}

@@ -1,0 +1,5 @@
+training_fraction_of_development_candidates,training_rows,training_candidates,heldout_test_rows,train_f1,test_f1,split_unit,label_note
+0.25,2347,240,2351,0.8662640207075065,0.8013816925734024,candidate_id,synthetic proxy-label agreement only
+0.5,4878,480,2351,0.8403225806451613,0.7952622673434856,candidate_id,synthetic proxy-label agreement only
+0.75,7257,720,2351,0.8428731762065096,0.8010471204188482,candidate_id,synthetic proxy-label agreement only
+1.0,9649,960,2351,0.837044745057232,0.8017316017316017,candidate_id,synthetic proxy-label agreement only

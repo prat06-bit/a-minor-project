@@ -1,0 +1,12 @@
+{
+  "seed": 20261020,
+  "n_candidates": 1200,
+  "n_internships": 350,
+  "n_pairs": 12000,
+  "corruption_levels": [0.0, 0.05, 0.10, 0.20],
+  "default_corruption_rate": 0.10,
+  "label_threshold": 0.56,
+  "skill_similarity_backend": "token_overlap",
+  "sentence_transformer_model": "sentence-transformers/all-MiniLM-L6-v2",
+  "output_dir": "data/outputs"
+}

@@ -1,0 +1,10 @@
+model,fold,train_rows,validation_rows,f1,split_unit,seed,development_candidate_fraction_for_cv,label_note
+logistic_regression,1,2196,1099,0.8081632653061225,candidate_id,20261020,0.35,synthetic proxy-label agreement only
+logistic_regression,2,2197,1098,0.7695167286245354,candidate_id,20261020,0.35,synthetic proxy-label agreement only
+logistic_regression,3,2197,1098,0.7898305084745763,candidate_id,20261020,0.35,synthetic proxy-label agreement only
+random_forest,1,2196,1099,0.7765151515151515,candidate_id,20261020,0.35,synthetic proxy-label agreement only
+random_forest,2,2197,1098,0.7628865979381443,candidate_id,20261020,0.35,synthetic proxy-label agreement only
+random_forest,3,2197,1098,0.7640449438202247,candidate_id,20261020,0.35,synthetic proxy-label agreement only
+gradient_boosting,1,2196,1099,0.8571428571428571,candidate_id,20261020,0.35,synthetic proxy-label agreement only
+gradient_boosting,2,2197,1098,0.8379629629629629,candidate_id,20261020,0.35,synthetic proxy-label agreement only
+gradient_boosting,3,2197,1098,0.860655737704918,candidate_id,20261020,0.35,synthetic proxy-label agreement only

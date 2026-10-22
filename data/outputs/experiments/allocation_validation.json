@@ -1,0 +1,10 @@
+{
+  "solver": "scipy.optimize.milp",
+  "solver_status": "Optimization terminated successfully. (HiGHS Status 7: Optimal)",
+  "eligible_pairs": 4800,
+  "allocations": 1109,
+  "unique_candidates_allocated": 1109,
+  "capacity_violations": 0,
+  "total_match_score": 696.591662,
+  "output": "C:\\Users\\LENOVO\\OneDrive\\Documents\\ChatGPT\\dataneededforpmis\\data\\outputs\\experiments\\capacity_aware_allocations.csv"
+}
