@@ -33,6 +33,14 @@ CATEGORICAL_FEATURES = [
     "internship_district",
 ]
 FEATURES = NUMERIC_FEATURES + CATEGORICAL_FEATURES
+MATCH_WEIGHTS = {
+    "qualification_compatibility": .25,
+    "course_compatibility": .17,
+    "specialization_compatibility": .08,
+    "skill_similarity": .18,
+    "sector_compatibility": .14,
+    "location_compatibility": .18,
+}
 
 
 def read_config(path: Path = DEFAULT_CONFIG) -> dict:
@@ -60,6 +68,97 @@ def load_sources(source: Path = SOURCE):
         return ["Main", "States", "Districts"], main, states, districts
 
 
+def load_opportunity_catalog(source: Path = SOURCE) -> pd.DataFrame:
+    """Return validated source internship rows without assigning synthetic IDs."""
+    _, main, _, _ = load_sources(source)
+    required = {
+        "Internship ID", "Company/Network Entity Name", "State / UT", "District",
+        "Sector", "Area/Field", "Qualification", "Course", "No Of Opportunities",
+    }
+    missing = required - set(main.columns)
+    if missing:
+        raise ValueError(f"Source internship catalog is missing columns: {sorted(missing)}")
+    identifiers = main["Internship ID"]
+    if identifiers.isna().any() or identifiers.astype(str).str.strip().eq("").any():
+        raise ValueError("Source internship IDs must be present and non-empty")
+    if identifiers.astype(str).duplicated().any():
+        raise ValueError("Source internship IDs must be unique")
+    capacity = pd.to_numeric(main["No Of Opportunities"], errors="coerce")
+    if capacity.isna().any() or not np.isfinite(capacity).all():
+        raise ValueError("Source internship capacities must be finite numbers")
+    if (capacity < 1).any() or not np.equal(capacity, np.floor(capacity)).all():
+        raise ValueError("Source internship capacities must be positive whole numbers")
+    for column in ("Company/Network Entity Name", "State / UT", "District", "Sector", "Qualification", "Course"):
+        if main[column].isna().any() or main[column].astype(str).str.strip().eq("").any():
+            raise ValueError(f"Source internship `{column}` values must be present")
+    applications = np.nan
+    if "Applications Received" in main:
+        applications = pd.to_numeric(main["Applications Received"], errors="coerce")
+        if applications.isna().any() or not np.isfinite(applications).all():
+            raise ValueError("Source application totals must be finite numbers")
+        if (applications < 0).any() or not np.equal(applications, np.floor(applications)).all():
+            raise ValueError("Source application totals must be non-negative whole numbers")
+    catalog = pd.DataFrame({
+        "internship_id": identifiers.astype(str),
+        "source_internship_id": identifiers.astype(str),
+        "company": main["Company/Network Entity Name"],
+        "state": main["State / UT"],
+        "district": main["District"],
+        "sector": main["Sector"],
+        "area": main["Area/Field"],
+        "qualification": main["Qualification"],
+        "course": main["Course"],
+        "specialization": main["Specialization"] if "Specialization" in main else np.nan,
+        "capacity": capacity.astype(int),
+        "source_applications_received": applications,
+        "record_origin": "observed_source_opportunity",
+        "source_row_number": np.arange(2, len(main) + 2),
+    })
+    catalog["provenance_json"] = catalog["source_row_number"].map(
+        lambda row: json.dumps(
+            {
+                "record_origin": "observed_source_opportunity",
+                "source_workbook": source.name,
+                "source_sheet": "Main",
+                "source_row_number": int(row),
+                "capacity": "source No Of Opportunities field",
+                "applications_received": "aggregate source count; not a candidate record",
+            },
+            sort_keys=True,
+        )
+    )
+    return catalog
+
+
+def validate_candidate_roster(candidates: pd.DataFrame, max_candidates: int = 250) -> pd.DataFrame:
+    """Validate an uploaded roster without persisting or mixing it with generated data."""
+    required = {"candidate_id", "qualification", "course"}
+    missing = required - set(candidates.columns)
+    if missing:
+        raise ValueError(f"Candidate roster is missing required columns: {sorted(missing)}")
+    if candidates.empty:
+        raise ValueError("Candidate roster contains no rows")
+    if len(candidates) > max_candidates:
+        raise ValueError(f"Candidate roster exceeds the {max_candidates}-candidate upload limit")
+    if candidates["candidate_id"].isna().any() or candidates["candidate_id"].astype(str).str.strip().eq("").any():
+        raise ValueError("Candidate IDs must be present and non-empty")
+    if candidates["candidate_id"].astype(str).duplicated().any():
+        raise ValueError("Candidate IDs must be unique")
+    for column in ("qualification", "course"):
+        if candidates[column].isna().any() or candidates[column].astype(str).str.strip().eq("").any():
+            raise ValueError(f"Candidate `{column}` values must be present and non-empty")
+    roster = candidates.copy()
+    roster["candidate_id"] = roster["candidate_id"].astype(str)
+    if "past_participation" in roster:
+        participation = pd.to_numeric(roster["past_participation"], errors="coerce")
+        invalid = roster["past_participation"].notna() & participation.isna()
+        if invalid.any() or not participation.dropna().isin([0, 1]).all():
+            raise ValueError("past_participation must contain only 0 or 1 when provided")
+        roster["past_participation"] = participation.fillna(0).astype(int)
+    roster["record_origin"] = "user_uploaded_candidate"
+    return roster
+
+
 def _words(value) -> set[str]:
     if pd.isna(value):
         return set()
@@ -78,6 +177,195 @@ def _compat(candidate, required, wildcard=()) -> float:
 def _qualification_level(q) -> int:
     levels = {"10th": 1, "12th": 2, "iti": 3, "diploma": 4, "graduation": 5, "post graduation": 6}
     return levels.get(str(q).strip().casefold(), 0)
+
+
+def _qualification_eligible(candidate, required) -> bool:
+    candidate_level = _qualification_level(candidate)
+    required_text = str(required).strip().casefold()
+    required_level = _qualification_level(required)
+    if candidate_level == 0:
+        return False
+    if required_text in {"any", "any qualification", "all"}:
+        return True
+    return required_level > 0 and candidate_level >= required_level
+
+
+def match_candidates(candidates: pd.DataFrame, internships: pd.DataFrame,
+                     policy_group_column: str | None = None) -> pd.DataFrame:
+    """Score candidates against opportunities using the documented rule baseline."""
+    candidate_required = {"candidate_id", "qualification", "course"}
+    internship_required = {
+        "internship_id", "qualification", "course", "capacity", "state",
+        "district", "sector", "area",
+    }
+    missing_candidates = candidate_required - set(candidates.columns)
+    missing_internships = internship_required - set(internships.columns)
+    if missing_candidates or missing_internships:
+        raise ValueError(
+            f"Missing matching columns; candidates: {sorted(missing_candidates)}, "
+            f"internships: {sorted(missing_internships)}"
+        )
+    if candidates["candidate_id"].isna().any() or candidates["candidate_id"].astype(str).str.strip().eq("").any():
+        raise ValueError("Candidate IDs must be present and non-empty")
+    if candidates["candidate_id"].astype(str).duplicated().any():
+        raise ValueError("Candidate IDs must be unique")
+    candidates = candidates.copy()
+    if "past_participation" not in candidates:
+        candidates["past_participation"] = 0
+    else:
+        participation = pd.to_numeric(candidates["past_participation"], errors="coerce")
+        invalid_participation = candidates["past_participation"].notna() & participation.isna()
+        if invalid_participation.any() or not participation.dropna().isin([0, 1]).all():
+            raise ValueError("past_participation must contain only 0 or 1 when provided")
+        candidates["past_participation"] = participation.fillna(0).astype(int)
+    if internships["internship_id"].isna().any() or internships["internship_id"].astype(str).str.strip().eq("").any():
+        raise ValueError("Internship IDs must be present and non-empty")
+    if internships["internship_id"].astype(str).duplicated().any():
+        raise ValueError("Internship IDs must be unique")
+    if policy_group_column:
+        if policy_group_column not in candidates.columns:
+            raise ValueError(f"Policy group column not found: {policy_group_column}")
+        if candidates[policy_group_column].isna().any():
+            raise ValueError("Policy group values must be present for every candidate")
+
+    rows = []
+    for _, candidate in candidates.iterrows():
+        interests = {
+            item.strip().casefold()
+            for item in str(candidate.get("sector_interests", "")).split(";")
+            if item.strip()
+        }
+        for _, internship in internships.iterrows():
+            qualification = float(
+                _qualification_eligible(candidate["qualification"], internship["qualification"])
+            )
+            course = _compat(candidate["course"], internship["course"], ("ANY", "All Subjects"))
+            specialization = _compat(
+                candidate.get("specialization", np.nan),
+                internship.get("specialization", np.nan),
+            )
+            candidate_skills = _words(candidate.get("skills", ""))
+            internship_skills = _words(
+                f"{internship.get('course', '')} {internship.get('specialization', '')} "
+                f"{internship.get('area', '')} {internship.get('sector', '')}"
+            )
+            skill = len(candidate_skills & internship_skills) / max(
+                1, len(candidate_skills | internship_skills)
+            )
+            sector = float(str(internship["sector"]).casefold() in interests)
+            preferred_state = candidate.get("preferred_state", "")
+            preferred_district = candidate.get("preferred_district", "")
+            location = (
+                .55 * float(str(internship["state"]).casefold() == str(preferred_state).casefold())
+                + .45 * float(
+                    str(internship["district"]).casefold() == str(preferred_district).casefold()
+                )
+            )
+            eligible = bool(qualification and course)
+            components = {
+                "qualification_compatibility": qualification,
+                "course_compatibility": course,
+                "specialization_compatibility": specialization,
+                "skill_similarity": skill,
+                "sector_compatibility": sector,
+                "location_compatibility": location,
+            }
+            score = sum(MATCH_WEIGHTS[name] * value for name, value in components.items())
+            failed = []
+            if not qualification:
+                failed.append("qualification requirement not met")
+            if not course:
+                failed.append("course requirement not met")
+            strong = [
+                name.replace("_compatibility", "").replace("_", " ")
+                for name, value in components.items()
+                if value >= .75
+            ]
+            explanation = (
+                "Eligible. Strongest compatibility: "
+                + (", ".join(strong) if strong else "combined feature score")
+                + f". Rule-based compatibility score {score:.3f}."
+                if eligible
+                else "Ineligible: " + "; ".join(failed) + "."
+            )
+            row = {
+                "candidate_id": str(candidate["candidate_id"]),
+                "internship_id": str(internship["internship_id"]),
+                "source_internship_id": internship.get("source_internship_id", ""),
+                "internship_company": internship.get("company", ""),
+                "internship_sector": internship["sector"],
+                "internship_state": internship["state"],
+                "internship_district": internship["district"],
+                "eligible": int(eligible),
+                "eligibility_explanation": "; ".join(failed) if failed else "All hard requirements passed",
+                "synthetic_match_score": round(score, 6),
+                **components,
+                "capacity_log": float(np.log1p(float(internship["capacity"]))),
+                "past_participation": int(candidate["past_participation"]),
+                "candidate_qualification": candidate["qualification"],
+                "internship_qualification": internship["qualification"],
+                "candidate_course": candidate["course"],
+                "internship_course": internship["course"],
+                "candidate_primary_sector": candidate.get("primary_sector", ""),
+                "internship_sector": internship["sector"],
+                "candidate_preferred_state": preferred_state,
+                "internship_state": internship["state"],
+                "candidate_preferred_district": preferred_district,
+                "internship_district": internship["district"],
+                "capacity": int(internship["capacity"]),
+                "why_recommended": explanation,
+                "record_origin": "rule_based_match_from_supplied_profiles",
+                "provenance_json": json.dumps(
+                    {
+                        "score": "documented_weighted_rule_baseline",
+                        "candidate": candidate.get("record_origin", "user_supplied"),
+                        "internship": internship.get("record_origin", "source_derived_sample"),
+                        "eligibility": "qualification_and_course_hard_filters",
+                    },
+                    sort_keys=True,
+                ),
+            }
+            if policy_group_column:
+                row[policy_group_column] = str(candidate[policy_group_column])
+            rows.append(row)
+    ranked = pd.DataFrame(rows)
+    if ranked.empty:
+        return ranked
+    ranked = ranked.sort_values(
+        ["candidate_id", "eligible", "synthetic_match_score", "internship_id"],
+        ascending=[True, False, False, True],
+    )
+    ranked["recommendation_rank"] = (
+        ranked.groupby("candidate_id").cumcount() + 1
+    )
+    return ranked.reset_index(drop=True)
+
+
+def allocation_fairness_summary(candidates: pd.DataFrame, allocations: pd.DataFrame,
+                                group_column: str) -> pd.DataFrame:
+    """Measure descriptive group allocation rates without using group in merit scores."""
+    if group_column not in candidates.columns:
+        raise ValueError(f"Policy group column not found: {group_column}")
+    if candidates["candidate_id"].duplicated().any():
+        raise ValueError("Candidate IDs must be unique for group allocation metrics")
+    groups = candidates[["candidate_id", group_column]].copy()
+    if groups[group_column].isna().any():
+        raise ValueError("Policy group values must be present to calculate group rates")
+    assigned_ids = set(allocations.get("candidate_id", pd.Series(dtype=str)).astype(str))
+    groups["allocated"] = groups["candidate_id"].astype(str).isin(assigned_ids)
+    overall_rate = float(groups["allocated"].mean()) if len(groups) else 0.0
+    counts = groups.groupby(group_column, dropna=False).agg(
+        candidate_count=("candidate_id", "size"),
+        allocated_count=("allocated", "sum"),
+        allocation_rate=("allocated", "mean"),
+    ).reset_index()
+    counts["allocation_rate_difference_vs_overall"] = (
+        counts["allocation_rate"] - overall_rate
+    )
+    counts["representation_share_of_allocations"] = (
+        counts["allocated_count"] / max(1, int(groups["allocated"].sum()))
+    )
+    return counts
 
 
 def generate(config: dict, source: Path = SOURCE, output_dir: Path | None = None) -> dict[str, Path]:
@@ -169,7 +457,7 @@ def generate(config: dict, source: Path = SOURCE, output_dir: Path | None = None
     label_threshold = float(config.get("label_threshold", .56))
     for k in range(n_p):
         c = cand_lookup.iloc[k]; it = int_lookup.iloc[k]
-        q = float(_qualification_level(c.qualification) >= _qualification_level(it.qualification))
+        q = float(_qualification_eligible(c.qualification, it.qualification))
         course = _compat(c.course, it.course, ("ANY", "All Subjects"))
         spec = _compat(c.specialization, it.specialization)
         skill = (float((semantic_scores[k]+1)/2) if semantic_scores is not None else
@@ -222,7 +510,10 @@ def generate(config: dict, source: Path = SOURCE, output_dir: Path | None = None
                 "positive_proxy_labels": int(pair_df.synthetic_proxy_label.sum()),
                 "negative_proxy_labels": int((1-pair_df.synthetic_proxy_label).sum()),
                 "target_definition": "synthetic heuristic; not observed PMIS selections",
-                "files": {k: str(v.relative_to(ROOT)) for k,v in files.items()}}
+                "files": {
+                    key: str(path.relative_to(ROOT)) if path.is_relative_to(ROOT) else str(path)
+                    for key, path in files.items()
+                }}
     (out / "generation_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return files
 
@@ -407,20 +698,64 @@ def _make_model(kind: str):
     return Pipeline([("preprocess",prep),("model",clf)])
 
 
-def evaluate_dataset(name: str, csv_path: Path, output_dir: Path, seed: int=42) -> list[dict]:
+def _ndcg_at_k(relevance, scores, k: int | None = None) -> float | None:
+    relevance = np.asarray(relevance, dtype=float)
+    scores = np.asarray(scores, dtype=float)
+    if len(relevance) != len(scores) or len(relevance) == 0:
+        return None
+    limit = len(relevance) if k is None else min(int(k), len(relevance))
+    if limit <= 0:
+        return None
+    order = np.argsort(-scores)[:limit]
+    ideal = np.argsort(-relevance)[:limit]
+    discounts = np.log2(np.arange(2, limit + 2))
+    dcg = float(np.sum((2 ** relevance[order] - 1) / discounts))
+    ideal_dcg = float(np.sum((2 ** relevance[ideal] - 1) / discounts))
+    return dcg / ideal_dcg if ideal_dcg else 0.0
+
+
+def candidate_grouped_split(df: pd.DataFrame, seed: int = 42):
+    """Return train/validation/test row indices with candidates isolated per split."""
     from sklearn.model_selection import GroupShuffleSplit
+
+    if "candidate_id" not in df or df["candidate_id"].isna().any():
+        raise ValueError("Evaluation data must contain non-missing candidate_id values")
+    groups = df["candidate_id"].astype(str).to_numpy()
+    all_rows = np.arange(len(df))
+    development, test = next(
+        GroupShuffleSplit(n_splits=1, test_size=.2, random_state=seed).split(
+            all_rows, groups=groups
+        )
+    )
+    train_relative, validation_relative = next(
+        GroupShuffleSplit(n_splits=1, test_size=.25, random_state=seed + 1).split(
+            development, groups=groups[development]
+        )
+    )
+    train = development[train_relative]
+    validation = development[validation_relative]
+    split_groups = [
+        set(groups[indexes])
+        for indexes in (train, validation, test)
+    ]
+    if any(
+        split_groups[left] & split_groups[right]
+        for left, right in ((0, 1), (0, 2), (1, 2))
+    ):
+        raise RuntimeError("Candidate leakage detected between evaluation partitions")
+    return train, validation, test
+
+
+def evaluate_dataset(name: str, csv_path: Path, output_dir: Path, seed: int=42) -> list[dict]:
     from sklearn.metrics import (precision_score,recall_score,f1_score,confusion_matrix,roc_auc_score,
-                                 average_precision_score,ndcg_score)
+                                 average_precision_score)
     df=pd.read_csv(csv_path)
     for col in NUMERIC_FEATURES: df[col]=pd.to_numeric(df[col],errors="coerce")
     for col in CATEGORICAL_FEATURES:
         df[col]=df[col].where(df[col].notna(),np.nan).astype(object)
-    y=df["synthetic_proxy_label"].astype(int).to_numpy(); groups=df["candidate_id"].astype(str).to_numpy()
-    split=GroupShuffleSplit(n_splits=1,test_size=.2,random_state=seed)
-    dev,te=next(split.split(df[FEATURES],y,groups))
-    inner=GroupShuffleSplit(n_splits=1,test_size=.25,random_state=seed+1)
-    tr_rel,val_rel=next(inner.split(df.iloc[dev][FEATURES],y[dev],groups[dev]))
-    tr=dev[tr_rel]; val=dev[val_rel]
+    y=df["synthetic_proxy_label"].astype(int).to_numpy()
+    tr,val,te=candidate_grouped_split(df,seed)
+    groups=df["candidate_id"].astype(str).to_numpy()
     x_train=df.iloc[tr][FEATURES]; x_val=df.iloc[val][FEATURES]; x_test=df.iloc[te][FEATURES]
     y_train=y[tr]; y_val=y[val]; y_test=y[te]
     reports=[]
@@ -446,91 +781,294 @@ def evaluate_dataset(name: str, csv_path: Path, output_dir: Path, seed: int=42) 
         except ValueError: ap=None
         # Per-candidate ranking quality: NDCG over held-out pairs.
         ranked=df.iloc[te][["candidate_id","synthetic_proxy_label"]].copy(); ranked["score"]=proba
-        ndcgs=[]
+        ndcg_at_5=[]; ndcg_at_10=[]; ndcg_full=[]
         for _,g in ranked.groupby("candidate_id"):
             if len(g)>1 and g.synthetic_proxy_label.sum()>0:
-                order=np.argsort(-g.score.to_numpy()); rel=g.synthetic_proxy_label.to_numpy()[order]
-                dcg=np.sum((2**rel-1)/np.log2(np.arange(2,len(rel)+2)))
-                ideal=np.sort(g.synthetic_proxy_label.to_numpy())[::-1]
-                idcg=np.sum((2**ideal-1)/np.log2(np.arange(2,len(ideal)+2)))
-                ndcgs.append(float(dcg/idcg) if idcg else 0.)
+                relevance=g.synthetic_proxy_label.to_numpy()
+                scores=g.score.to_numpy()
+                ndcg_at_5.append(_ndcg_at_k(relevance,scores,5))
+                ndcg_at_10.append(_ndcg_at_k(relevance,scores,10))
+                ndcg_full.append(_ndcg_at_k(relevance,scores))
         reports.append({"dataset":name,"model":model_name,"train_rows":len(tr),"validation_rows":len(val),"test_rows":len(te),
             "train_candidates":int(pd.Series(groups[tr]).nunique()),"validation_candidates":int(pd.Series(groups[val]).nunique()),
             "test_candidates":int(pd.Series(groups[te]).nunique()),"train_f1":f1_score(y_train,train_pred,zero_division=0),
             "validation_f1":f1_score(y_val,val_pred,zero_division=0),"precision":precision_score(y_test,pred,zero_division=0),
             "recall":recall_score(y_test,pred,zero_division=0),"f1":f1_score(y_test,pred,zero_division=0),
-            "roc_auc":auc,"pr_auc":ap,"ndcg_at_full_list":float(np.mean(ndcgs)) if ndcgs else None,
+            "roc_auc":auc,"pr_auc":ap,
+            "ndcg_at_5":float(np.mean(ndcg_at_5)) if ndcg_at_5 else None,
+            "ndcg_at_10":float(np.mean(ndcg_at_10)) if ndcg_at_10 else None,
+            "ndcg_at_full_list":float(np.mean(ndcg_full)) if ndcg_full else None,
             "tn":int(tn),"fp":int(fp),"fn":int(fn),"tp":int(tp),"fit_seconds":fit_seconds,
             "inference_seconds":infer_seconds,"inference_ms_per_row":infer_seconds/max(1,len(te))*1000,
             "label_note":"agreement with synthetic heuristic labels only; not observed PMIS outcome accuracy"})
     return reports
 
 
-def allocate(pairs_csv: Path, output_csv: Path, time_limit: float=15.0) -> dict:
-    """Max-score assignment with one placement per candidate and internship capacities."""
-    df=pd.read_csv(pairs_csv)
-    edges=df[(df["eligible"]==1)].copy().reset_index(drop=True)
-    if edges.empty: raise ValueError("No eligible pairs available for allocation")
-    edges["utility"]=edges["synthetic_match_score"].astype(float)
-    candidates=edges.candidate_id.unique(); internships=edges.internship_id.unique()
-    # OR-Tools CP-SAT is the primary optimizer. SciPy MILP is a compatible local
-    # fallback so the prototype remains runnable in a minimal installation.
-    try:
-        from ortools.sat.python import cp_model
-        model=cp_model.CpModel(); variables=[model.NewBoolVar(f"x_{j}") for j in range(len(edges))]
-        by_candidate=edges.groupby("candidate_id").indices
-        by_internship=edges.groupby("internship_id").indices
-        for indexes in by_candidate.values(): model.Add(sum(variables[int(j)] for j in indexes)<=1)
-        for internship,indexes in by_internship.items():
-            cap=int(edges.loc[indexes[0],"capacity"])
-            model.Add(sum(variables[int(j)] for j in indexes)<=cap)
-        model.Maximize(sum(int(round(float(edges.loc[j,"utility"])*1_000_000))*variables[j] for j in range(len(edges))))
-        solver=cp_model.CpSolver(); solver.parameters.max_time_in_seconds=float(time_limit)
-        solver.parameters.num_search_workers=8; status=solver.Solve(model)
-        if status not in (cp_model.OPTIMAL,cp_model.FEASIBLE): raise RuntimeError(f"Capacity allocation failed: {solver.status_name(status)}")
-        edges["allocated"]=[solver.Value(v) for v in variables]
-        solver_name="ortools_cp_sat"; solver_status=solver.StatusName(status)
-    except ImportError:
-        from scipy.optimize import milp, Bounds, LinearConstraint
-        from scipy.sparse import lil_matrix
-        rows=len(candidates)+len(internships); A=lil_matrix((rows,len(edges)),dtype=float)
-        c_map={v:i for i,v in enumerate(candidates)}; i_map={v:i+len(candidates) for i,v in enumerate(internships)}
-        for j,e in edges.iterrows(): A[c_map[e.candidate_id],j]=1; A[i_map[e.internship_id],j]=1
-        upper=np.r_[np.ones(len(candidates)),edges.groupby("internship_id").capacity.first().reindex(internships).to_numpy(dtype=float)]
-        result=milp(c=-edges.utility.to_numpy(),integrality=np.ones(len(edges)),bounds=Bounds(0,1),
-                    constraints=LinearConstraint(A.tocsr(),np.zeros(rows),upper),options={"time_limit":time_limit})
-        if result.x is None: raise RuntimeError(f"Capacity allocation failed: {result.message}")
-        edges["allocated"]=(result.x>.5).astype(int)
-        solver_name="scipy.optimize.milp"; solver_status=str(result.message)
-    chosen=edges[edges.allocated==1].copy()
-    all_scores=edges[["candidate_id","internship_id","synthetic_match_score"]].copy()
-    alt=all_scores[~all_scores.index.isin(chosen.index)].sort_values("synthetic_match_score",ascending=False).drop_duplicates("candidate_id")
-    alt_map=alt.set_index("candidate_id")["synthetic_match_score"].to_dict()
-    chosen["best_unselected_alternative_score"]=chosen.candidate_id.map(alt_map)
-    chosen["capacity_at_limit"]=chosen.groupby("internship_id").internship_id.transform("size") >= chosen.groupby("internship_id").capacity.transform("first")
-    def explain(r):
-        parts=[]
-        for col,label in [("qualification_compatibility","qualification"),("course_compatibility","course"),
-                          ("specialization_compatibility","specialization"),("skill_similarity","skill overlap"),
-                          ("sector_compatibility","sector preference"),("location_compatibility","location preference")]:
-            parts.append(f"{label}={float(r[col]):.2f}")
-        capacity_note="assigned internship reached its capacity" if r.capacity_at_limit else "assigned internship retained capacity"
-        alt_score=r.best_unselected_alternative_score
-        if pd.notna(alt_score) and float(alt_score)>float(r.synthetic_match_score)+1e-6:
-            alternative_note=f"A higher-scoring unselected alternative scored {float(alt_score):.3f}; global capacity competition affected the assignment."
-        elif pd.notna(alt_score):
-            alternative_note=f"Best unselected alternative scored {float(alt_score):.3f}, below the assigned score."
-        else:
-            alternative_note="No other eligible option was present in this pair sample."
-        return f"Eligible; score {float(r.synthetic_match_score):.3f} ({', '.join(parts)}); {capacity_note}. {alternative_note}"
-    chosen["allocation_explanation"]=chosen.apply(explain,axis=1)
-    chosen["decision_layer_note"]="Eligibility filter and capacity optimizer are separate; no affirmative-action policy configured."
-    output_csv.parent.mkdir(parents=True,exist_ok=True); chosen.to_csv(output_csv,index=False)
-    violations=int((chosen.groupby("internship_id").size()>chosen.groupby("internship_id").capacity.first()).sum())
-    return {"solver":solver_name, "solver_status":solver_status,"eligible_pairs":len(edges),
-            "allocations":len(chosen),"unique_candidates_allocated":int(chosen.candidate_id.nunique()),
-            "capacity_violations":violations,"total_match_score":float(chosen.synthetic_match_score.sum()),
-            "output":str(output_csv)}
+def allocate(pairs_csv: Path | pd.DataFrame, output_csv: Path, time_limit: float = 15.0,
+             policy_group_column: str | None = None,
+             policy_minimums: dict[str, int] | None = None) -> dict:
+    """Maximize compatibility under eligibility, candidate, capacity, and explicit policy rules."""
+    df = pairs_csv.copy() if isinstance(pairs_csv, pd.DataFrame) else pd.read_csv(pairs_csv)
+    required = {
+        "candidate_id", "internship_id", "eligible", "synthetic_match_score", "capacity",
+        "candidate_qualification", "internship_qualification", "candidate_course",
+        "internship_course",
+    }
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Allocation input is missing required columns: {sorted(missing)}")
+    if df.empty:
+        raise ValueError("Allocation input contains no candidate–internship pairs")
+    for column in ("candidate_id", "internship_id"):
+        if df[column].isna().any() or df[column].astype(str).str.strip().eq("").any():
+            raise ValueError(f"{column} values must be present and non-empty")
+    if df.duplicated(["candidate_id", "internship_id"]).any():
+        raise ValueError("Allocation input contains duplicate candidate–internship pairs")
+
+    eligible = pd.to_numeric(df["eligible"], errors="coerce")
+    scores = pd.to_numeric(df["synthetic_match_score"], errors="coerce")
+    capacities = pd.to_numeric(df["capacity"], errors="coerce")
+    if eligible.isna().any() or not eligible.isin([0, 1]).all():
+        raise ValueError("Eligibility values must be binary (0 or 1)")
+    if scores.isna().any() or not np.isfinite(scores).all() or not scores.between(0, 1).all():
+        raise ValueError("Compatibility scores must be finite values between 0 and 1")
+    if capacities.isna().any() or not np.isfinite(capacities).all() or (capacities < 0).any():
+        raise ValueError("Internship capacities must be finite, non-negative numbers")
+    if not np.equal(capacities, np.floor(capacities)).all():
+        raise ValueError("Internship capacities must be whole numbers")
+    df["eligible"] = eligible.astype(int)
+    df["synthetic_match_score"] = scores.astype(float)
+    df["capacity"] = capacities.astype(int)
+    if df.groupby("internship_id")["capacity"].nunique().gt(1).any():
+        raise ValueError("Each internship must have one consistent capacity value")
+
+    policy_minimums = policy_minimums or {}
+    if policy_minimums:
+        if not policy_group_column or policy_group_column not in df.columns:
+            raise ValueError("Configured group minimums require a policy group column in the input")
+        if df[policy_group_column].isna().any():
+            raise ValueError("Policy group values must be present for every candidate")
+        group_counts = df.groupby("candidate_id")[policy_group_column].nunique()
+        if group_counts.gt(1).any():
+            raise ValueError("Each candidate must have exactly one policy group")
+        for group, minimum in policy_minimums.items():
+            if not isinstance(minimum, int) or minimum < 0:
+                raise ValueError("Policy minimums must be non-negative whole numbers")
+            if minimum > int(df.loc[df[policy_group_column] == group, "candidate_id"].nunique()):
+                raise ValueError(f"Policy minimum for {group!r} exceeds the available group size")
+
+    # Recompute hard requirements rather than trusting an incoming eligibility flag.
+    hard_eligible = (
+        df.apply(
+            lambda row: (
+                _qualification_eligible(
+                    row["candidate_qualification"], row["internship_qualification"]
+                )
+                and _compat(row["candidate_course"], row["internship_course"], ("ANY", "All Subjects"))
+            ),
+            axis=1,
+        )
+    )
+    all_candidates = df["candidate_id"].astype(str).unique()
+    internships = df.drop_duplicates("internship_id").set_index("internship_id")["capacity"]
+    edges = df.loc[(df["eligible"] == 1) & hard_eligible].copy().reset_index(drop=True)
+    edges["utility"] = edges["synthetic_match_score"]
+    if policy_minimums:
+        eligible_group_counts = edges.groupby(policy_group_column)["candidate_id"].nunique()
+        for group, minimum in policy_minimums.items():
+            available = int(eligible_group_counts.get(group, 0))
+            if minimum > available:
+                raise RuntimeError(
+                    f"Policy minimum for {group!r} is infeasible: "
+                    f"{available} eligible candidate(s), minimum {minimum}"
+                )
+    solver_name = "not_run"
+    solver_status = "no_hard_eligible_pairs"
+    if not edges.empty:
+        candidates = edges["candidate_id"].unique()
+        edge_internships = edges["internship_id"].unique()
+        try:
+            from ortools.sat.python import cp_model
+            model = cp_model.CpModel()
+            variables = [model.NewBoolVar(f"x_{j}") for j in range(len(edges))]
+            by_candidate = edges.groupby("candidate_id").indices
+            by_internship = edges.groupby("internship_id").indices
+            for indexes in by_candidate.values():
+                model.Add(sum(variables[int(j)] for j in indexes) <= 1)
+            for internship, indexes in by_internship.items():
+                model.Add(
+                    sum(variables[int(j)] for j in indexes)
+                    <= int(internships.loc[internship])
+                )
+            if policy_minimums:
+                for group, minimum in policy_minimums.items():
+                    group_indexes = edges.index[edges[policy_group_column] == group].tolist()
+                    model.Add(sum(variables[j] for j in group_indexes) >= minimum)
+            model.Maximize(
+                sum(
+                    int(round(float(edges.loc[j, "utility"]) * 1_000_000)) * variables[j]
+                    for j in range(len(edges))
+                )
+            )
+            solver = cp_model.CpSolver()
+            solver.parameters.max_time_in_seconds = float(time_limit)
+            solver.parameters.num_search_workers = 8
+            status = solver.Solve(model)
+            if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                raise RuntimeError(f"Capacity allocation failed: {solver.StatusName(status)}")
+            edges["allocated"] = [solver.Value(variable) for variable in variables]
+            solver_name = "ortools_cp_sat"
+            solver_status = solver.StatusName(status)
+        except ImportError:
+            from scipy.optimize import Bounds, LinearConstraint, milp
+            from scipy.sparse import lil_matrix
+            policy_groups = list(policy_minimums)
+            rows = len(candidates) + len(edge_internships) + len(policy_groups)
+            matrix = lil_matrix((rows, len(edges)), dtype=float)
+            candidate_map = {value: index for index, value in enumerate(candidates)}
+            internship_map = {
+                value: index + len(candidates)
+                for index, value in enumerate(edge_internships)
+            }
+            policy_map = {
+                value: index + len(candidates) + len(edge_internships)
+                for index, value in enumerate(policy_groups)
+            }
+            for index, edge in edges.iterrows():
+                matrix[candidate_map[edge.candidate_id], index] = 1
+                matrix[internship_map[edge.internship_id], index] = 1
+                if policy_minimums and edge[policy_group_column] in policy_map:
+                    matrix[policy_map[edge[policy_group_column]], index] = 1
+            lower = np.r_[
+                np.zeros(len(candidates) + len(edge_internships)),
+                [policy_minimums[group] for group in policy_groups],
+            ]
+            upper = np.r_[
+                np.ones(len(candidates)),
+                internships.reindex(edge_internships).to_numpy(dtype=float),
+                np.full(len(policy_groups), np.inf),
+            ]
+            result = milp(
+                c=-edges["utility"].to_numpy(),
+                integrality=np.ones(len(edges)),
+                bounds=Bounds(0, 1),
+                constraints=LinearConstraint(matrix.tocsr(), lower, upper),
+                options={"time_limit": time_limit},
+            )
+            if result.x is None:
+                raise RuntimeError(f"Capacity allocation failed: {result.message}")
+            edges["allocated"] = (result.x > .5).astype(int)
+            solver_name = "scipy.optimize.milp"
+            solver_status = str(result.message)
+
+    chosen = edges[edges["allocated"] == 1].copy() if "allocated" in edges else edges.copy()
+    if not chosen.empty:
+        alternatives = edges[
+            ~edges.index.isin(chosen.index)
+        ].sort_values("synthetic_match_score", ascending=False).drop_duplicates("candidate_id")
+        alternative_scores = alternatives.set_index("candidate_id")["synthetic_match_score"]
+        chosen["best_unselected_alternative_score"] = chosen["candidate_id"].map(alternative_scores)
+        chosen["capacity_at_limit"] = (
+            chosen.groupby("internship_id")["internship_id"].transform("size")
+            >= chosen.groupby("internship_id")["capacity"].transform("first")
+        )
+
+        def explain(row):
+            components = [
+                ("qualification_compatibility", "qualification"),
+                ("course_compatibility", "course"),
+                ("specialization_compatibility", "specialization"),
+                ("skill_similarity", "skill overlap"),
+                ("sector_compatibility", "sector preference"),
+                ("location_compatibility", "location preference"),
+            ]
+            details = [
+                f"{label}={float(row[column]):.2f}"
+                for column, label in components
+                if column in row.index and pd.notna(row[column])
+            ]
+            capacity_note = (
+                "assigned internship reached its capacity"
+                if row["capacity_at_limit"]
+                else "assigned internship retained capacity"
+            )
+            alternative = row["best_unselected_alternative_score"]
+            if pd.isna(alternative):
+                alternative_note = "No other eligible option was present."
+            elif float(alternative) > float(row["synthetic_match_score"]) + 1e-6:
+                alternative_note = (
+                    f"A higher-scoring unassigned alternative scored {float(alternative):.3f}; "
+                    "capacity competition affected the assignment."
+                )
+            else:
+                alternative_note = (
+                    f"Best unassigned alternative scored {float(alternative):.3f}, "
+                    "below the assigned score."
+                )
+            return (
+                f"Eligible; score {float(row['synthetic_match_score']):.3f} "
+                f"({', '.join(details)}); {capacity_note}. {alternative_note}"
+            )
+
+        chosen["allocation_explanation"] = chosen.apply(explain, axis=1)
+        chosen["decision_layer_note"] = (
+            "Eligibility and capacity optimization are separate. "
+            + (
+                f"Explicit group minimums applied: {policy_minimums}."
+                if policy_minimums
+                else "No equity policy constraint configured."
+            )
+        )
+    else:
+        chosen = edges.copy()
+        for column, dtype in (
+            ("best_unselected_alternative_score", float),
+            ("capacity_at_limit", bool),
+            ("allocation_explanation", object),
+            ("decision_layer_note", object),
+        ):
+            chosen[column] = pd.Series(dtype=dtype)
+
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    chosen.to_csv(output_csv, index=False)
+    assigned_counts = chosen.groupby("internship_id").size()
+    violations = int(
+        sum(
+            max(0, int(count) - int(internships.loc[internship]))
+            for internship, count in assigned_counts.items()
+        )
+    )
+    total_seats = int(internships.sum())
+    assigned_count = int(len(chosen))
+    allocated_candidates = int(chosen["candidate_id"].nunique())
+    eligibility_violations = int(
+        sum(
+            not (
+                _qualification_eligible(row["candidate_qualification"], row["internship_qualification"])
+                and _compat(row["candidate_course"], row["internship_course"], ("ANY", "All Subjects"))
+            )
+            for _, row in chosen.iterrows()
+        )
+    )
+    return {
+        "solver": solver_name,
+        "solver_status": solver_status,
+        "eligible_pairs": int(len(edges)),
+        "eligible_candidates": int(edges["candidate_id"].nunique()),
+        "allocations": assigned_count,
+        "unique_candidates_allocated": allocated_candidates,
+        "unallocated_candidates": int(len(all_candidates) - allocated_candidates),
+        "total_seats": total_seats,
+        "unused_seats": max(0, total_seats - assigned_count),
+        "seat_utilization": assigned_count / total_seats if total_seats else 0.0,
+        "allocation_rate": allocated_candidates / len(all_candidates) if len(all_candidates) else 0.0,
+        "capacity_violations": violations,
+        "eligibility_violations": eligibility_violations,
+        "total_match_score": float(chosen["synthetic_match_score"].sum()),
+        "policy_group_column": policy_group_column if policy_minimums else None,
+        "policy_minimums": policy_minimums,
+        "output": str(output_csv),
+    }
 
 
 def learning_curve(clean_pairs: Path, output_csv: Path, seed: int) -> pd.DataFrame:
@@ -726,10 +1264,15 @@ def run_all(config: dict, source: Path=SOURCE, output_dir: Path|None=None) -> No
     report_lines=["# Synthetic experiment results","",
         "All metrics below measure agreement with `synthetic_proxy_label`, a generated heuristic target. They are not real PMIS selection accuracy.","",
         "## Clean candidate-grouped holdout","",
-        "| Model | Precision | Recall | F1 | ROC-AUC | PR-AUC | NDCG | Train F1 | Validation F1 | Fit seconds | Inference ms/row |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+        "| Model | Precision | Recall | F1 | ROC-AUC | PR-AUC | NDCG@5 | NDCG@10 | NDCG full | Train F1 | Validation F1 | Fit seconds | Inference ms/row |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for model_name,row in clean_metrics.iterrows():
-        report_lines.append(f"| {model_name} | {row.precision:.3f} | {row.recall:.3f} | {row.f1:.3f} | {row.roc_auc:.3f} | {row.pr_auc:.3f} | {row.ndcg_at_full_list:.3f} | {row.train_f1:.3f} | {row.validation_f1:.3f} | {row.fit_seconds:.3f} | {row.inference_ms_per_row:.3f} |")
+        report_lines.append(
+            f"| {model_name} | {row.precision:.3f} | {row.recall:.3f} | {row.f1:.3f} | "
+            f"{row.roc_auc:.3f} | {row.pr_auc:.3f} | {row.ndcg_at_5:.3f} | "
+            f"{row.ndcg_at_10:.3f} | {row.ndcg_at_full_list:.3f} | {row.train_f1:.3f} | "
+            f"{row.validation_f1:.3f} | {row.fit_seconds:.3f} | {row.inference_ms_per_row:.3f} |"
+        )
     report_lines += ["", "## Data quality by condition", "",
         "| Dataset | Rows | Duplicate IDs | Missing cells | Non-numeric capacity | App/capacity >10 | Unknown categories | Out-of-range skill values | Positive proxy rate |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
